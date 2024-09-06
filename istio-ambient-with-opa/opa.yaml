@@ -1,0 +1,196 @@
+############################################################
+# Overwrite mesh config to add OPA as an external authorizer.
+############################################################
+apiVersion: v1
+data:
+  mesh: |-
+    extensionProviders:
+    - name: opa-ext-authz-grpc
+      envoyExtAuthzGrpc:
+        service: opa-istio.platform.svc.cluster.local
+        port: 9191
+    defaultConfig:
+      discoveryAddress: istiod.istio-system.svc:15012
+      image:
+        imageType: distroless
+      proxyMetadata:
+        ISTIO_META_ENABLE_HBONE: "true"
+    defaultProviders:
+      metrics:
+      - prometheus
+    enablePrometheusMerge: true
+    rootNamespace: istio-system
+    trustDomain: cluster.local
+  meshNetworks: 'networks: {}'
+kind: ConfigMap
+metadata:
+  labels:
+    install.operator.istio.io/owning-resource: installed-state
+    install.operator.istio.io/owning-resource-namespace: istio-system
+    istio.io/rev: default
+    operator.istio.io/component: Pilot
+    operator.istio.io/managed: Reconcile
+    operator.istio.io/version: 1.23.0
+    release: istio
+  name: istio
+  namespace: istio-system
+---
+############################################################
+# AuthorizationPolicy to tell Istio to use OPA as the Authz Server
+############################################################
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: ext-authz
+  namespace: app
+spec:
+  action: CUSTOM
+  provider:
+    name: opa-ext-authz-grpc
+  rules:
+  - to:
+    - operation:
+        notPaths: ["/health"]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opa-istio-config
+  namespace: platform
+data:
+  config.yaml: |
+    plugins:
+      envoy_ext_authz_grpc:
+        addr: 0.0.0.0:9191
+        path: istio/authz/allow
+    decision_logs:
+      console: true
+---
+############################################################
+# Example policy to enforce on OPA-Istio sidecars.
+############################################################
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opa-policy
+  namespace: platform
+data:
+  policy.rego: |
+    package istio.authz
+
+    import input.attributes.request.http as http_request
+    import input.parsed_path
+
+    default allow = false
+
+    allow {
+        parsed_path[0] == "health"
+        http_request.method == "GET"
+    }
+
+    allow {
+        roles_for_user[r]
+        required_roles[r]
+    }
+
+    roles_for_user[r] {
+        r := user_roles[user_name][_]
+    }
+
+    required_roles[r] {
+        perm := role_perms[r][_]
+        perm.method = http_request.method
+        perm.path = http_request.path
+    }
+
+    user_name = parsed {
+        [_, encoded] := split(http_request.headers.authorization, " ")
+        [parsed, _] := split(base64url.decode(encoded), ":")
+    }
+
+    user_roles = {
+        "alice": ["guest"],
+        "bob": ["admin"]
+    }
+
+    role_perms = {
+        "guest": [
+            {"method": "GET",  "path": "/productpage"},
+        ],
+        "admin": [
+            {"method": "GET",  "path": "/productpage"},
+            {"method": "GET",  "path": "/api/v1/products"},
+        ],
+    }
+---
+############################################################
+# Example configuration to bootstrap OPA-Istio sidecars.
+############################################################
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opa-istio
+  namespace: platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: opa-istio
+  template:
+    metadata:
+      labels:
+        app: opa-istio
+    spec:
+      containers:
+      - name: opa-istio
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 9191
+          protocol: TCP
+        - containerPort: 8282
+          protocol: TCP
+        - containerPort: 8181
+          protocol: TCP
+        image: openpolicyagent/opa:0.68.0-istio-4-static
+        args:
+        - "run"
+        - "--server"
+        - "--addr=0.0.0.0:8181"
+        - "--config-file=/config/config.yaml"
+        - "--diagnostic-addr=0.0.0.0:8282"
+        - "/policy/policy.rego"
+        volumeMounts:
+        - name: opa-istio-config
+          mountPath: /config
+        - name: opa-policy
+          mountPath: /policy
+        livenessProbe:
+          httpGet:
+            path: /health?plugins
+            port: 8282
+        readinessProbe:
+          httpGet:
+            path: /health?plugins
+            port: 8282
+      volumes:
+      - name: opa-istio-config
+        configMap:
+          name: opa-istio-config
+      - name: opa-policy
+        configMap:
+          name: opa-policy
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opa-istio
+  namespace: platform
+spec:
+  ports:
+  - name: grpc
+    protocol: TCP
+    port: 9191
+    targetPort: 9191
+  selector:
+    app: opa-istio
+---
